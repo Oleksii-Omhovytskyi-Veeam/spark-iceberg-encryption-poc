@@ -1,0 +1,22 @@
+# Standalone Hive Metastore (apache/hive 4.0.0) with the Postgres JDBC driver
+# baked in. The stock apache/hive image does NOT ship a Postgres driver, so
+# schematool / the metastore cannot talk to Postgres without this.
+FROM apache/hive:4.0.0
+
+USER root
+
+# Postgres JDBC driver -> /opt/hive/lib so the metastore + schematool find it.
+ARG POSTGRES_JDBC_VERSION=42.7.3
+ADD https://repo1.maven.org/maven2/org/postgresql/postgresql/${POSTGRES_JDBC_VERSION}/postgresql-${POSTGRES_JDBC_VERSION}.jar \
+    /opt/hive/lib/postgresql.jar
+RUN chmod 644 /opt/hive/lib/postgresql.jar
+
+# metastore-site.xml: warehouse on the shared volume, thrift on 9083.
+COPY hive/metastore-site.xml /opt/hive/conf/metastore-site.xml
+
+# Schema init helper: init Postgres schema on first boot, then start metastore.
+COPY hive/entrypoint-init.sh /entrypoint-init.sh
+RUN chmod +x /entrypoint-init.sh
+
+USER hive
+ENTRYPOINT ["/entrypoint-init.sh"]

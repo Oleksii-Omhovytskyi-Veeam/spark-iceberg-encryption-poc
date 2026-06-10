@@ -1,0 +1,239 @@
+# Iceberg 1.11.0 NATIVE table encryption with AWS KMS, using Iceberg's BUILT-IN
+# AwsKeyManagementClient (org.apache.iceberg.aws.AwsKeyManagementClient) -- NO
+# custom jar. Tested locally against LocalStack (no real AWS account). Two
+# tenant backup namespaces (demo.tenant1_backup, demo.tenant2_backup) each
+# create an encrypted ObjectVersions table with a DIFFERENT per-tenant KMS key
+# (alias/iceberg/tenant1 vs alias/iceberg/tenant2). The built-in client
+# wraps/unwraps the per-file Iceberg DEK via KMS Encrypt/Decrypt (and supports
+# GenerateDataKey); the master keys never leave KMS.
+#
+# Activation: spark.sql.catalog.demo.encryption.kms-type=aws  -- Iceberg's
+# EncryptionUtil.createKmsClient maps "aws" to the built-in
+# org.apache.iceberg.aws.AwsKeyManagementClient (pulled in via iceberg-aws-bundle
+# on the --packages classpath). No --jars, no Maven build for spark.
+#
+# This is the SIBLING of ../iceberg-native-aws-kms (custom-jar variant). It uses
+# DIFFERENT container_names and host ports (KMS 4568, Connect 15003, UI 4042, pg
+# none, hms 9084) so both demos can run side-by-side without clashing.
+#
+# Quick start:
+#   docker compose up -d spark-connect          # brings up localstack + pg + hms
+#   docker compose run --rm go-client            # two-namespace / two-key demo
+#   docker compose run --rm spark                # PySpark job + PARE/AGS1 proofs
+#
+# (HiveCatalog is the ONLY catalog with KMS wiring at Iceberg 1.11.0, hence type=hive.)
+services:
+  # ---------------------------------------------------------------------------
+  # LocalStack: emulated AWS KMS. The init script under ready.d/ provisions the
+  # two symmetric per-tenant master keys + aliases (alias/iceberg/tenant1,
+  # alias/iceberg/tenant2) once KMS is up. No real AWS account needed; creds are
+  # the LocalStack test/test.
+  # ---------------------------------------------------------------------------
+  localstack:
+    image: localstack/localstack:4
+    container_name: iceberg-awskms-builtin-localstack
+    environment:
+      SERVICES: kms
+      AWS_DEFAULT_REGION: us-east-1
+      DEBUG: "0"
+    ports:
+      # Host port 4568 (the custom-jar sibling uses 4567). The in-compose network
+      # address stays localstack:4566 (containers talk over the demo network).
+      - "4568:4566"
+    volumes:
+      - ./localstack/init-kms.sh:/etc/localstack/init/ready.d/init-kms.sh:ro
+    healthcheck:
+      # Ready once KMS reports available AND our two aliases exist (the init
+      # script has finished). Uses awslocal, which ships in the image.
+      test: ["CMD-SHELL", "awslocal kms list-aliases --region us-east-1 --query \"Aliases[?AliasName=='alias/iceberg/tenant1'].AliasName\" --output text | grep -q tenant1"]
+      interval: 6s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    networks: [demo]
+
+  postgres:
+    image: postgres:16
+    container_name: iceberg-awskms-builtin-postgres
+    environment:
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+      POSTGRES_DB: metastore
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d metastore"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [demo]
+
+  hive-metastore:
+    # apache/hive 4.0.0 standalone metastore + baked-in Postgres JDBC driver.
+    build:
+      context: .
+      dockerfile: Dockerfile.hive
+    image: iceberg-awskms-builtin-hive-metastore:4.0.0
+    container_name: iceberg-awskms-builtin-hive-metastore
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      IS_RESUME: "true"
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=hive
+    ports:
+      - "9084:9083"
+    volumes:
+      - warehouse:/data/warehouse
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/9083' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    networks: [demo]
+
+  # ---------------------------------------------------------------------------
+  # One-shot PySpark batch job: creates BOTH encrypted tables (two namespaces,
+  # two KMS keys), inserts + reads, and runs the PARE/AGS1 encryption proofs for
+  # BOTH tables server-side. Run with: docker compose run --rm spark
+  #
+  # NOTE: uses the STOCK apache/spark image directly (no custom Dockerfile). The
+  # built-in AwsKeyManagementClient ships INSIDE the iceberg-aws-bundle, which is
+  # resolved by --packages into the SAME Spark user classloader as the iceberg
+  # runtime jar -- so EncryptionUtil.createKmsClient (which loads the client via
+  # the user classloader) finds it. job.py is bind-mounted, not baked.
+  # ---------------------------------------------------------------------------
+  spark:
+    image: apache/spark:4.0.0-scala2.13-java17-python3-ubuntu
+    container_name: iceberg-awskms-builtin-spark
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    # Run as root so the spark process can write into the shared warehouse
+    # volume, whose namespace dirs are created by the Hive metastore (hive user).
+    user: "0:0"
+    environment: &aws_env
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    volumes:
+      - warehouse:/data/warehouse
+      - ./app:/opt/spark/work-dir/app:ro
+      - ivy-cache:/home/spark/.ivy2
+    networks: [demo]
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        exec /opt/spark/bin/spark-submit \
+          --master "local[2]" \
+          --driver-memory 2g \
+          --packages org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.11.0,org.apache.iceberg:iceberg-aws-bundle:1.11.0 \
+          --conf spark.jars.ivy=/home/spark/.ivy2 \
+          --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+          --conf spark.sql.catalog.demo=org.apache.iceberg.spark.SparkCatalog \
+          --conf spark.sql.catalog.demo.type=hive \
+          --conf spark.sql.catalog.demo.uri=thrift://hive-metastore:9083 \
+          --conf spark.sql.catalog.demo.warehouse=file:///data/warehouse \
+          --conf spark.sql.catalog.demo.encryption.kms-type=aws \
+          --conf spark.sql.catalog.demo.kms.endpoint=http://localstack:4566 \
+          --conf spark.sql.catalog.demo.client.region=us-east-1 \
+          /opt/spark/work-dir/app/job.py
+
+  # ---------------------------------------------------------------------------
+  # Spark Connect server (long-running). The Go client connects over gRPC on
+  # :15002 (published to host :15003) and runs SQL; the catalog, the built-in KMS
+  # client, and the AWS credentials all live HERE, server-side. The remote client
+  # never holds a key.
+  #
+  # Launch mechanism: run the Connect server's main class DIRECTLY in the
+  # FOREGROUND via spark-submit --class
+  # org.apache.spark.sql.connect.service.SparkConnectServer (sbin/start-connect-
+  # server.sh would daemonize and let the container exit). This reuses the EXACT
+  # same --packages/--conf wiring as the `spark` service so the built-in KMS
+  # client (from iceberg-aws-bundle) loads in the same Spark user classloader as
+  # the Iceberg runtime.
+  # ---------------------------------------------------------------------------
+  spark-connect:
+    image: apache/spark:4.0.0-scala2.13-java17-python3-ubuntu
+    container_name: iceberg-awskms-builtin-spark-connect
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    user: "0:0"
+    environment: *aws_env
+    ports:
+      - "15003:15002"   # Spark Connect gRPC (sibling uses 15002)
+      - "4042:4040"     # Spark UI (sibling uses 4041)
+    volumes:
+      - warehouse:/data/warehouse
+      - ivy-cache:/home/spark/.ivy2
+    networks: [demo]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/15002' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        exec /opt/spark/bin/spark-submit \
+          --master "local[2]" \
+          --driver-memory 2g \
+          --class org.apache.spark.sql.connect.service.SparkConnectServer \
+          --name "iceberg-native-aws-kms-builtin-connect" \
+          --packages org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.11.0,org.apache.iceberg:iceberg-aws-bundle:1.11.0,org.apache.spark:spark-connect_2.13:4.0.0 \
+          --conf spark.jars.ivy=/home/spark/.ivy2 \
+          --conf spark.connect.grpc.binding.port=15002 \
+          --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+          --conf spark.sql.catalog.demo=org.apache.iceberg.spark.SparkCatalog \
+          --conf spark.sql.catalog.demo.type=hive \
+          --conf spark.sql.catalog.demo.uri=thrift://hive-metastore:9083 \
+          --conf spark.sql.catalog.demo.warehouse=file:///data/warehouse \
+          --conf spark.sql.catalog.demo.encryption.kms-type=aws \
+          --conf spark.sql.catalog.demo.kms.endpoint=http://localstack:4566 \
+          --conf spark.sql.catalog.demo.client.region=us-east-1
+
+  # ---------------------------------------------------------------------------
+  # External Go client (spark-connect-go v35). Talks to spark-connect:15002 over
+  # gRPC and drives TWO tenant-backup namespaces with TWO different KMS keys:
+  #   demo.tenant1_backup.ObjectVersions (encryption.key-id = alias/iceberg/tenant1)
+  #   demo.tenant2_backup.ObjectVersions (encryption.key-id = alias/iceberg/tenant2)
+  # Pure remote client -- no Spark, no Iceberg, no KMS, no AWS creds inside it.
+  # ---------------------------------------------------------------------------
+  go-client:
+    build:
+      context: ./go-client
+      dockerfile: Dockerfile
+    image: iceberg-awskms-builtin-go-client:1.0
+    container_name: iceberg-awskms-builtin-go-client
+    depends_on:
+      spark-connect:
+        condition: service_healthy
+    environment:
+      SPARK_CONNECT_REMOTE: ${SPARK_CONNECT_REMOTE:-sc://spark-connect:15002}
+    networks: [demo]
+
+volumes:
+  pg-data:
+  warehouse:
+  ivy-cache:
+
+networks:
+  demo:
+    driver: bridge
